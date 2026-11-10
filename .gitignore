@@ -1,0 +1,7 @@
+/annotator_config.json
+/annotations/
+/.venv-segmenter/
+__pycache__/
+*.py[cod]
+.DS_Store
+*.tmp
