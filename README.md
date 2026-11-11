@@ -52,6 +52,9 @@ The videos are never modified.
    starts when something appears or disappears, or when a person changes their action.
    Segments are consecutive and cover the whole video. A video in which nothing
    changes is one segment.
+   A segment of **40 frames or fewer** is almost certainly a mistake: it is marked in red
+   in the list and on the timeline, a warning asks you to delete one of its boundaries,
+   and saving asks for confirmation.
 3. Select a segment in the list to jump to its start. **Move start ◀ -1 / +1 ▶**
    shifts its start by one frame; **Remove start boundary** merges it into the previous segment.
 4. Save with **Ctrl+S** (macOS: **Cmd+S**). You can stop at any time and continue later.

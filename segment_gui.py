@@ -434,6 +434,30 @@ def boundaries_to_segments(bounds, n_frames):
     return list(zip(starts, ends))
 
 
+# A segment this short (or shorter) is almost certainly a mistake: the annotator
+# is asked to delete one of its boundaries.
+SHORT_SEGMENT_FRAMES = 40
+
+
+def short_segment_indices(segs, limit=SHORT_SEGMENT_FRAMES):
+    """Indices of the (start, end_inclusive) segments with at most `limit` frames."""
+    return [i for i, (s, e) in enumerate(segs) if e - s + 1 <= limit]
+
+
+def short_segment_warning(segs, limit=SHORT_SEGMENT_FRAMES):
+    """Text telling the annotator which segments are too short, or "" when none is."""
+    idx = short_segment_indices(segs, limit)
+    if not idx:
+        return ""
+    names = ", ".join(str(i) for i in idx)
+    return ("Segment%s %s %s %d frames or fewer. Delete a boundary of %s "
+            "to merge %s with a neighbouring segment."
+            % ("s" if len(idx) > 1 else "", names,
+               "are" if len(idx) > 1 else "is", limit,
+               "each of them" if len(idx) > 1 else "it",
+               "them" if len(idx) > 1 else "it"))
+
+
 def segments_to_boundaries(pairs):
     return [p[0] for p in pairs[1:]]
 
@@ -1306,6 +1330,14 @@ class AnnotateWindow(tk.Toplevel):
     def _build_segments_panel(self, parent):
         box = ttk.LabelFrame(parent, text="Segments — select one to jump to its start")
         box.pack(fill="both", expand=True)
+        # Always two lines high, so the layout does not jump when a warning appears.
+        self.short_warning_var = tk.StringVar(value="")
+        self.short_warning = tk.Label(box, textvariable=self.short_warning_var, height=2,
+                                      fg="#c62828", justify="left", anchor="nw",
+                                      font=("Helvetica", 11, "bold"))
+        self.short_warning.pack(fill="x", padx=6, pady=(2, 0))
+        box.bind("<Configure>", lambda e: self.short_warning.configure(
+            wraplength=max(100, e.width - 16)))
         self.seg_list = tk.Listbox(box, height=7, activestyle="dotbox", exportselection=False,
                                   font=("Helvetica", 12))
         self.seg_list.pack(fill="both", expand=True, padx=4, pady=4)
@@ -1567,8 +1599,13 @@ class AnnotateWindow(tk.Toplevel):
         for i, (s, e) in enumerate(segs):
             x0 = x(s)
             x1 = max(x(e), x(s) + 1)
+            short = e - s + 1 <= SHORT_SEGMENT_FRAMES
             fill = "#90caf9" if s == self.cur_seg_start else colors[i % 2]
-            c.create_rectangle(x0, 3, x1, 19, fill=fill, outline="#999")
+            if short and s != self.cur_seg_start:
+                fill = "#ffab91"
+            c.create_rectangle(x0, 3, x1, 19, fill=fill,
+                               outline="#c62828" if short else "#999",
+                               width=2 if short else 1)
             if x1 - x0 > 34:
                 c.create_text((x0 + x1) / 2, 11, text="%d–%d" % (s, e),
                               font=("Helvetica", 7), fill="#333")
@@ -1611,8 +1648,10 @@ class AnnotateWindow(tk.Toplevel):
         self.frame_info_var.set("Frame %d / %d   %s" % (self.frame_idx, self.n_frames - 1, seg_txt))
 
     def _segment_label(self, i, start, end):
-        return "Segment %d   frames %d–%d   (%d frame%s)" % (
-            i, start, end, end - start + 1, "" if end == start else "s")
+        n = end - start + 1
+        short = "   ⚠ too short: delete a boundary" if n <= SHORT_SEGMENT_FRAMES else ""
+        return "Segment %d   frames %d–%d   (%d frame%s)%s" % (
+            i, start, end, n, "" if n == 1 else "s", short)
 
     def _refresh_segment_list(self):
         segs = self.model.segments()
@@ -1620,6 +1659,9 @@ class AnnotateWindow(tk.Toplevel):
         lb.delete(0, "end")
         for i, (s, e) in enumerate(segs):
             lb.insert("end", self._segment_label(i, s, e))
+            if e - s + 1 <= SHORT_SEGMENT_FRAMES:
+                lb.itemconfig(i, foreground="#c62828")
+        self.short_warning_var.set(short_segment_warning(segs))
         sel = self._selected_index()
         lb.selection_set(sel)
         lb.see(sel)
@@ -1717,6 +1759,10 @@ class AnnotateWindow(tk.Toplevel):
             self._update_status()
 
     def save(self):
+        warning = short_segment_warning(self.model.segments())
+        if warning and not messagebox.askyesno(
+                APP_NAME, warning + "\n\nSave anyway? You can continue later.", parent=self):
+            return False
         segs = self.model.to_segments(self.stats)
         payload = build_annotation_payload(
             self.env, self.vid, self.app.annotator_id, segs)
@@ -1888,6 +1934,16 @@ def run_selftest(dataset_root=None, full_scene_limit=1):
         ok, _, new = m.nudge_boundary(100, 1)
         check("model nudge", ok and new == 101 and m.boundaries == [50, 101], str(m.boundaries))
         check("model nudge collision", not m.nudge_boundary(50, 51)[0])
+        lim = SHORT_SEGMENT_FRAMES
+        edge = boundaries_to_segments([lim, lim + 1 + lim, 3 * lim], 5 * lim)
+        check("short segments: <= limit flagged, limit+1 not",
+              short_segment_indices(edge) == [0, 2] and edge[1] == (lim, 2 * lim)
+              and short_segment_indices([(0, lim - 1), (lim, 2 * lim)]) == [0],
+              str(short_segment_indices(edge)))
+        check("short segment warning text",
+              short_segment_warning([(0, 99)]) == ""
+              and "Segment 1 is" in short_segment_warning([(0, 99), (100, 120), (121, 400)])
+              and "Segments 0, 2 are" in short_segment_warning([(0, 9), (10, 99), (100, 120)]))
         check("model segment 0 fixed", not m.remove_boundary(0)[0]
               and not m.nudge_boundary(0, 1)[0])
         m.remove_boundary(50)
@@ -2013,6 +2069,36 @@ def _guitest_step2(app):
     w.add_boundary()
     assert w.seg_list.size() == 3 and w.cur_seg_start == 120, "expected 3 segments"
     assert w.dirty, "adding boundaries should mark the window unsaved"
+    assert not w.short_warning_var.get(), "no short segment yet, but a warning is shown"
+    # a segment of <= 40 frames is flagged everywhere and asked about when saving
+    w._seek(120 + SHORT_SEGMENT_FRAMES - 1)
+    w.add_boundary()
+    assert w.model.segments()[2] == (120, 120 + SHORT_SEGMENT_FRAMES - 2), w.model.segments()
+    assert "Segment 2 is" in w.short_warning_var.get() and "Delete a boundary" in \
+        w.short_warning_var.get(), "short segment warning missing"
+    assert "⚠" in w.seg_list.get(2) and "⚠" not in w.seg_list.get(1), "list does not flag it"
+    prompts = []
+    real_ask = messagebox.askyesno
+    messagebox.askyesno = lambda *a, **k: prompts.append(a[1]) or False
+    try:
+        assert not w.save() and len(prompts) == 1 and "Segment 2" in prompts[0], \
+            "saving with a short segment did not ask"
+        assert load_json_safe(scene_file_path(app.annotator_id, w.env, w.vid)) is None, \
+            "a declined save wrote a file"
+    finally:
+        messagebox.askyesno = real_ask
+    w._seek(120 + SHORT_SEGMENT_FRAMES - 1)   # inside the last segment
+    assert w.cur_seg_start == 120 + SHORT_SEGMENT_FRAMES - 1
+    w.nudge_boundary(1)
+    assert w.short_warning_var.get(), "40 frames is still too short"
+    w.nudge_boundary(1)
+    assert w.model.segments()[2][1] - w.model.segments()[2][0] + 1 == SHORT_SEGMENT_FRAMES + 1 \
+        and not w.short_warning_var.get(), "a segment of 41 frames must not be flagged"
+    w.nudge_boundary(-1)
+    assert w.short_warning_var.get(), "warning did not come back"
+    w._select_segment(3, jump=True)
+    w.delete_boundary()
+    assert not w.short_warning_var.get() and w.seg_list.size() == 3, "warning not cleared"
     # paused playhead in segment 0 -> the selection follows it
     w._seek(10)
     assert w.cur_seg_start == 0, "segment selection did not follow the playhead"
