@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
 import re
@@ -67,9 +68,15 @@ PROJECT_DIR = (os.path.join(os.path.expanduser("~"), "FireVAD-Segmenter")
 IR_DIR_NAME = "IR"
 RGB_DIR_NAME = "RGB"
 
-# Newer scenes store all IR frames in a single compressed archive:
-#   IR.npz -> key "frames": (N, H, W) float16 array of °C temperature matrices.
-# Legacy scenes keep one .npy matrix per frame inside an IR/ folder.
+# Three IR layouts are supported:
+#   IR_delta.npz  (Antunovic_VAD_rgb_ir_dataset) frame-to-frame differences of the
+#                 float16 temperature matrices, split into byte planes "lo" and
+#                 "hi" (format "ir-delta-shuffle-v1", see IR_COMPRESSION.md there),
+#   IR.npz        key "frames": (N, H, W) float16 array of °C temperature matrices,
+#   IR/           one .npy temperature matrix per frame (legacy).
+IR_DELTA_NAME = "IR_delta.npz"
+IR_DELTA_FORMAT = "ir-delta-shuffle-v1"
+IR_DELTA_CHUNK = 32           # frames decoded at a time: keeps the peak memory low
 IR_ARCHIVE_NAME = "IR.npz"
 IR_ARCHIVE_KEY = "frames"
 
@@ -185,8 +192,20 @@ def enable_windows_dpi_awareness():
 # Dataset discovery
 # --------------------------------------------------------------------------
 
+def _read_npy_header(f):
+    """(shape, dtype) from the header of an .npy stream; None for unknown versions."""
+    version = np.lib.format.read_magic(f)
+    if version == (1, 0):
+        shape, _, dtype = np.lib.format.read_array_header_1_0(f)
+    elif version == (2, 0):
+        shape, _, dtype = np.lib.format.read_array_header_2_0(f)
+    else:
+        return None
+    return shape, dtype
+
+
 def npz_stack_info(path, key=IR_ARCHIVE_KEY):
-    """Return (shape, dtype) of the stacked array inside an IR.npz archive.
+    """Return (shape, dtype) of the stacked array inside an .npz archive.
 
     Reads only the zip entry's npy header, so scene discovery stays fast
     without decompressing the (potentially large) frame data.
@@ -198,41 +217,103 @@ def npz_stack_info(path, key=IR_ARCHIVE_KEY):
             if member not in zf.namelist():
                 return None
             with zf.open(member) as f:
-                version = np.lib.format.read_magic(f)
-                if version == (1, 0):
-                    shape, _, dtype = np.lib.format.read_array_header_1_0(f)
-                elif version == (2, 0):
-                    shape, _, dtype = np.lib.format.read_array_header_2_0(f)
-                else:
-                    return None
-        return shape, dtype
+                return _read_npy_header(f)
     except Exception:
         return None
+
+
+def delta_archive_info(path):
+    """Shape (N, H, W) of an IR_delta.npz archive, or None when it is not one."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+            if not {"format.npy", "lo.npy", "hi.npy"} <= names:
+                return None
+            with zf.open("lo.npy") as f:
+                info = _read_npy_header(f)
+        shape = info[0] if info else None
+        return shape if shape and len(shape) == 3 else None
+    except Exception:
+        return None
+
+
+def _read_exact(f, nbytes):
+    data = f.read(nbytes)
+    if len(data) != nbytes:
+        raise ValueError("The IR archive is truncated or damaged.")
+    return data
+
+
+def decode_delta_archive(path, progress=None):
+    """Decode an IR_delta.npz archive into a float16 (N, H, W) stack of °C.
+
+    The byte planes are streamed in chunks of IR_DELTA_CHUNK frames, so the peak
+    memory is the decoded stack plus a few megabytes (not the whole archive
+    unpacked). The result is bit-identical to the original frames:
+    d = hi << 8 | lo;  u = cumulative sum of d along the frame axis modulo 2**16;
+    frames = u viewed as float16.  `progress(done, total)` is called per chunk.
+    """
+    with zipfile.ZipFile(path) as zf:
+        with zf.open("format.npy") as f:
+            fmt = str(np.load(io.BytesIO(f.read()), allow_pickle=False))
+        if fmt != IR_DELTA_FORMAT:
+            raise ValueError("Unsupported IR archive format %r." % fmt)
+        with zf.open("lo.npy") as flo, zf.open("hi.npy") as fhi:
+            lo_info, hi_info = _read_npy_header(flo), _read_npy_header(fhi)
+            if (not lo_info or not hi_info or lo_info[0] != hi_info[0]
+                    or len(lo_info[0]) != 3):
+                raise ValueError("The IR archive has unexpected contents.")
+            n, h, w = lo_info[0]
+            out = np.empty((n, h, w), dtype=np.float16)
+            prev = np.zeros((h, w), dtype=np.uint16)
+            for start in range(0, n, IR_DELTA_CHUNK):
+                k = min(IR_DELTA_CHUNK, n - start)
+                lo = np.frombuffer(_read_exact(flo, k * h * w), dtype=np.uint8).reshape(k, h, w)
+                hi = np.frombuffer(_read_exact(fhi, k * h * w), dtype=np.uint8).reshape(k, h, w)
+                d = (hi.astype(np.uint16) << 8) | lo
+                d[0] += prev                    # wraps modulo 2**16, as encoded
+                u = np.cumsum(d, axis=0, dtype=np.uint16)
+                out[start:start + k] = u.view(np.float16)
+                prev = u[-1]
+                if progress:
+                    progress(start + k, n)
+    return out
 
 
 def make_ir_loader(scene):
     """Return (loader, n_frames) giving per-frame 2D temperature matrices.
 
     Legacy folder format: loader(i) loads the i-th IR/*.npy file from disk.
-    Archive format: loader(i) indexes the stacked 'frames' array of IR.npz;
-    the archive is decompressed exactly once and cached in the closure (a
-    lock keeps the first load safe when the stats thread races the UI).
+    Archive formats: loader(i) indexes the decoded stack of the scene. The stack
+    is decoded exactly once and cached in the closure (a lock keeps the first
+    load safe when the stats thread races the UI); loader.preload(progress)
+    decodes it ahead of time so the UI can show a progress bar.
     Out-of-range indices are clamped (last frame is held), mirroring the
     legacy behaviour when RGB and IR counts differ.
     """
-    if scene.get("ir_format") == "archive":
+    fmt = scene.get("ir_format")
+    if fmt in ("delta", "archive"):
         state = {"stack": None}
         lock = threading.Lock()
 
-        def load(i):
+        def stack_of(progress=None):
             with lock:
                 if state["stack"] is None:
-                    with np.load(scene["ir_archive"]) as z:
-                        state["stack"] = z[IR_ARCHIVE_KEY]
-                stack = state["stack"]
-            n = stack.shape[0]
-            return stack[min(max(i, 0), n - 1)]
+                    if fmt == "delta":
+                        state["stack"] = decode_delta_archive(scene["ir_archive"], progress)
+                    else:
+                        with np.load(scene["ir_archive"]) as z:
+                            state["stack"] = z[IR_ARCHIVE_KEY]
+                return state["stack"]
 
+        def load(i):
+            stack = stack_of()
+            return stack[min(max(i, 0), stack.shape[0] - 1)]
+
+        load.preload = lambda progress=None: stack_of(progress)
+        if fmt == "delta":
+            info = delta_archive_info(scene["ir_archive"])
+            return load, (int(info[0]) if info else 0)
         info = npz_stack_info(scene["ir_archive"])
         return load, (int(info[0][0]) if info else 0)
 
@@ -248,10 +329,8 @@ def make_ir_loader(scene):
 def discover_scenes(dataset_root):
     """Scan dataset_root/environment_N/<scene_id> and list scenes.
 
-    Two IR layouts are supported:
-      * legacy:  IR/ folder with one .npy temperature matrix per frame,
-      * archive: a single compressed IR.npz with a stacked 'frames' array.
-    When both are present the archive takes precedence.
+    Three IR layouts are supported (see IR_DELTA_NAME): IR_delta.npz, IR.npz and
+    the legacy IR/ folder of .npy files. The first one present is used, in that order.
     """
     scenes = []
     if not dataset_root or not os.path.isdir(dataset_root):
@@ -274,24 +353,32 @@ def discover_scenes(dataset_root):
                                          {".jpg", ".jpeg", ".png"})
             if not rgb_files:
                 continue
+            delta = os.path.join(scene_dir, IR_DELTA_NAME)
             archive = os.path.join(scene_dir, IR_ARCHIVE_NAME)
-            ir_files = list_frame_files(os.path.join(scene_dir, IR_DIR_NAME), {".npy"})
-            if os.path.isfile(archive):
+            if os.path.isfile(delta):
+                shape = delta_archive_info(delta)
+                if shape is None:
+                    continue  # unreadable or unknown archive: skip scene
+                ir_format, ir_count, archive = "delta", int(shape[0]), delta
+                ir_files = []
+            elif os.path.isfile(archive):
                 info = npz_stack_info(archive)
                 if info is None or len(info[0]) < 2:
                     continue  # unreadable or non-stack archive: skip scene
                 ir_format, ir_count = "archive", int(info[0][0])
-            elif ir_files:
-                ir_format, ir_count = "folder", len(ir_files)
+                ir_files = []
             else:
-                continue
+                ir_files = list_frame_files(os.path.join(scene_dir, IR_DIR_NAME), {".npy"})
+                if not ir_files:
+                    continue
+                ir_format, ir_count = "folder", len(ir_files)
             scenes.append({
                 "environment": env_id,
                 "scene": scene_id,
                 "path": scene_dir,
                 "ir_format": ir_format,
-                "ir_archive": archive if ir_format == "archive" else None,
-                "ir_files": ir_files if ir_format == "folder" else [],
+                "ir_archive": archive if ir_format in ("delta", "archive") else None,
+                "ir_files": ir_files,
                 "ir_count": ir_count,
                 "rgb_files": rgb_files,
                 "n_frames": max(ir_count, len(rgb_files)),
@@ -300,15 +387,25 @@ def discover_scenes(dataset_root):
     return scenes
 
 
-DATASET_DIR_NAME = "test_VAD"
+# Dataset folders the tool looks for, in order of preference.
+DATASET_DIR_NAMES = ("Antunovic_VAD", "test_VAD")
 _ENV_DIR_RE = re.compile(r"environment_\d+")
 _SEARCH_SKIP = {"annotations", "__pycache__", "node_modules"}
 
 NO_DATASET_MESSAGE = (
     "No fire-VAD videos were found in that folder or its subfolders "
     "(looking for environment_1, environment_2, ... folders).\n\n"
-    "If you downloaded test_VAD.zip, extract (unzip) it first and then "
+    "If you downloaded a ZIP file, extract (unzip) it first and then "
     "select the extracted folder.")
+
+
+def _dataset_rank(name):
+    """0 for the preferred dataset folder names, then the next ones, then the rest."""
+    low = name.lower()
+    for rank, prefix in enumerate(DATASET_DIR_NAMES):
+        if low.startswith(prefix.lower()):
+            return rank
+    return len(DATASET_DIR_NAMES)
 
 
 def _is_dir(entry):
@@ -333,7 +430,7 @@ def find_dataset_root(path, max_depth=3, budget=None, exclude=()):
     """Return path itself or the shallowest folder below it that is a dataset root.
 
     Unzipping often adds wrapper folders (Windows "Extract All" turns
-    test_VAD.zip into test_VAD/test_VAD/environment_1), so annotators may
+    a ZIP file into <name>/<name>/environment_1), so annotators may
     pick whichever folder they downloaded.  ``budget`` (a one-item list,
     shared between calls) caps the number of folders listed so that a large
     Downloads folder is searched quickly; ``exclude`` holds folders that were
@@ -352,11 +449,10 @@ def find_dataset_root(path, max_depth=3, budget=None, exclude=()):
             budget[0] -= 1
             try:
                 with os.scandir(folder) as it:
-                    # test_VAD* folders first, then alphabetical: deterministic
+                    # preferred dataset folders first, then alphabetical: deterministic
                     # when several datasets sit side by side.
                     subdirs = sorted((e for e in it if _is_dir(e)), key=lambda e: (
-                        not e.name.lower().startswith(DATASET_DIR_NAME.lower()),
-                        e.name.lower()))
+                        _dataset_rank(e.name), e.name.lower()))
             except OSError:
                 continue
             if any(_ENV_DIR_RE.fullmatch(e.name) for e in subdirs):
@@ -418,8 +514,8 @@ def locate_dataset_near_tool():
 
 
 def default_dataset_root():
-    """A dataset found near the tool (independent of cwd), else <tool>/test_VAD."""
-    return locate_dataset_near_tool() or os.path.join(SCRIPT_DIR, DATASET_DIR_NAME)
+    """A dataset found near the tool (independent of cwd), else <tool>/<first dataset name>."""
+    return locate_dataset_near_tool() or os.path.join(SCRIPT_DIR, DATASET_DIR_NAMES[0])
 
 
 # --------------------------------------------------------------------------
@@ -899,12 +995,12 @@ class AnnotationApp(tk.Tk):
         root = find_dataset_root(self.cfg.get("dataset_root")) or locate_dataset_near_tool()
         if not root:
             messagebox.showinfo(
-                APP_NAME, "The video folder (test_VAD) was not found next to the tool.\n\n"
+                APP_NAME, "The video folder (Antunovic_VAD_rgb_ir_dataset) was not found next to the tool.\n\n"
                 "In the next window, select the folder where you extracted "
-                "test_VAD.zip.", parent=self)
+                "the dataset.", parent=self)
         while not root:
             chosen = filedialog.askdirectory(
-                title="Select the folder with the fire-VAD videos (test_VAD)", parent=self)
+                title="Select the folder with the fire-VAD videos (environment_1, ...)", parent=self)
             if not chosen:
                 break
             root = find_dataset_root(chosen)
@@ -988,7 +1084,7 @@ class AnnotationApp(tk.Tk):
 
     def change_dataset(self):
         chosen = filedialog.askdirectory(
-            title="Select the folder with the fire-VAD videos (test_VAD)", parent=self)
+            title="Select the folder with the fire-VAD videos (environment_1, ...)", parent=self)
         if not chosen:
             return
         root = find_dataset_root(chosen)
@@ -1029,9 +1125,48 @@ class AnnotationApp(tk.Tk):
             messagebox.showinfo(APP_NAME, "Select a scene first.", parent=self)
             return
         if self._annotate_open():
-            messagebox.showinfo(APP_NAME, "Close the open annotation window first.", parent=self)
+            messagebox.showinfo(APP_NAME, "Close the open segmentation window first.", parent=self)
             return
-        self.active_window = AnnotateWindow(self, self.scenes[int(sel[0])])
+        scene = self.scenes[int(sel[0])]
+        loader = make_ir_loader(scene)
+        if not self._preload_ir(scene, loader[0]):
+            return
+        self.active_window = AnnotateWindow(self, scene, loader)
+
+    def _preload_ir(self, scene, load):
+        """Decode the IR stack of a scene behind a progress bar. False on failure."""
+        preload = getattr(load, "preload", None)
+        if preload is None:
+            return True
+        dlg = tk.Toplevel(self)
+        dlg.title("Loading")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        ttk.Label(dlg, text="Loading environment %d · scene %d …"
+                  % (scene["environment"], scene["scene"])).pack(padx=20, pady=(16, 8))
+        bar = ttk.Progressbar(dlg, length=320, maximum=max(1, scene["ir_count"]))
+        bar.pack(padx=20, pady=(0, 16))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+        dlg.update_idletasks()
+        px = self.winfo_x() + (self.winfo_width() - dlg.winfo_width()) // 2
+        py = self.winfo_y() + (self.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry("+%d+%d" % (max(px, 40), max(py, 40)))
+        dlg.grab_set()      # nothing else can be clicked while the scene decodes
+
+        def progress(done, total):
+            bar["value"] = done
+            dlg.update()
+
+        try:
+            dlg.update()
+            preload(progress)
+        except Exception as e:
+            dlg.destroy()
+            messagebox.showerror(APP_NAME, "Could not load the IR frames of this scene:\n%s" % e,
+                                 parent=self)
+            return False
+        dlg.destroy()
+        return True
 
     def export_all(self):
         out = {
@@ -1094,7 +1229,7 @@ TIMELINE_H = 34
 
 class AnnotateWindow(tk.Toplevel):
 
-    def __init__(self, app, scene):
+    def __init__(self, app, scene, ir_loader=None):
         super().__init__(app)
         self.app = app
         self.scene = scene
@@ -1104,7 +1239,7 @@ class AnnotateWindow(tk.Toplevel):
 
         self.ir_files = scene["ir_files"]
         self.rgb_files = scene["rgb_files"]
-        self._ir_loader, self.n_ir = make_ir_loader(scene)
+        self._ir_loader, self.n_ir = ir_loader or make_ir_loader(scene)
         self.n_rgb = len(self.rgb_files)
         if self.n_ir != self.n_rgb:
             self.after(300, lambda: messagebox.showwarning(
@@ -1859,14 +1994,62 @@ def run_selftest(dataset_root=None, full_scene_limit=1):
 
     tmp = tempfile.mkdtemp(prefix="firevad_selftest_")
     try:
+        # IR_delta.npz decoding: synthetic archive, built with the documented encoder.
+        # 70 frames cross the chunk boundaries; large random jumps force modulo-2**16 wrap.
+        rng = np.random.default_rng(1)
+        synth = (rng.standard_normal((70, 6, 8)) * 40 + 25).astype(np.float16)
+        u = synth.view(np.uint16)
+        diff = u.copy()
+        diff[1:] = u[1:] - u[:-1]
+        synth_path = os.path.join(tmp, "synthetic_IR_delta.npz")
+        np.savez_compressed(synth_path, format=np.array(IR_DELTA_FORMAT),
+                            frame_indices=np.arange(70, dtype=np.int32),
+                            lo=(diff & 0xFF).astype(np.uint8), hi=(diff >> 8).astype(np.uint8))
+        seen = []
+        decoded = decode_delta_archive(synth_path, lambda d, t: seen.append((d, t)))
+        check("delta decode is bit-exact",
+              decoded.shape == synth.shape and np.array_equal(decoded.view(np.uint16), u))
+        check("delta decode progress", seen and seen[-1] == (70, 70) and len(seen) == 3, str(seen))
+        check("delta archive header", delta_archive_info(synth_path) == (70, 6, 8)
+              and delta_archive_info(os.path.join(tmp, "missing.npz")) is None)
+        bad_path = os.path.join(tmp, "bad_format.npz")
+        np.savez_compressed(bad_path, format=np.array("other"), lo=diff.astype(np.uint8),
+                            hi=diff.astype(np.uint8))
+        try:
+            decode_delta_archive(bad_path)
+            check("unknown archive format rejected", False)
+        except ValueError:
+            check("unknown archive format rejected", True)
+
+        sampled, seen_env = set(), set()
+        for si, sc in enumerate(scenes):         # loading is checked on one scene per environment
+            if sc["environment"] not in seen_env:
+                seen_env.add(sc["environment"])
+                sampled.add(si)
         for si, sc in enumerate(scenes):
             env, vid, n = sc["environment"], sc["scene"], sc["n_frames"]
             loader, n_ir = make_ir_loader(sc)
             n_rgb = len(sc["rgb_files"])
             check("scene %d/%d files" % (env, vid), n_ir > 0 and n_rgb > 0,
                   "ir=%d rgb=%d format=%s" % (n_ir, n_rgb, sc["ir_format"]))
+            if si not in sampled:
+                continue
             try:
                 ir = loader(0)
+                if sc["ir_format"] == "delta":
+                    # the three-line decode documented in the dataset's IR_COMPRESSION.md
+                    with np.load(sc["ir_archive"]) as z:
+                        dd = (z["hi"].astype(np.uint16) << 8) | z["lo"].astype(np.uint16)
+                        ref = np.cumsum(dd, axis=0, dtype=np.uint16).view(np.float16)
+                        ref_idx = z["frame_indices"]
+                    last = loader(n_ir - 1)
+                    check("scene %d/%d delta matches reference decode" % (env, vid),
+                          np.array_equal(ref[0].view(np.uint16), ir.view(np.uint16))
+                          and np.array_equal(ref[-1].view(np.uint16), last.view(np.uint16))
+                          and len(ref_idx) == n_ir
+                          and [i for i, _ in sc["rgb_files"]] == list(map(int, ref_idx)),
+                          "frames=%d" % n_ir)
+                    del ref, dd
                 with Image.open(sc["rgb_files"][0][1]) as im:
                     rgb = np.array(im.convert("RGB"))
                 check("scene %d/%d ir 2D" % (env, vid),
@@ -1882,7 +2065,7 @@ def run_selftest(dataset_root=None, full_scene_limit=1):
             except Exception as e:
                 check("scene %d/%d load" % (env, vid), False, repr(e))
 
-            if si < full_scene_limit:
+            if si == min(sampled):
                 cache = os.path.join(tmp, "cache_e%d_s%d.json" % (env, vid))
                 partial = {"n_frames": n, "complete": False,
                            "frame_min": [0.0] * n, "frame_max": [1.0] * n}

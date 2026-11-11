@@ -22,8 +22,14 @@ pip install -r requirements.txt
 python segment_gui.py
 ```
 
-The tool looks for the folder `test_VAD` next to itself (or one or two folders up).
-If it is not found, it asks you to select it.
+The tool looks for the dataset folder (`Antunovic_VAD_rgb_ir_dataset`, otherwise `test_VAD`)
+next to itself or one or two folders up. If it is not found, it asks you to select it.
+
+Supported IR layouts: `IR_delta.npz` (the Antunovic dataset, lossless frame-difference
+archive), `IR.npz` and a legacy `IR/` folder of `.npy` files. A scene is decoded once when
+you open it (a progress bar is shown, a few seconds for the largest scenes) and then kept in
+memory: about 0.4 GB for a typical scene, up to about 1.6 GB for the longest (3298 frames).
+The per-frame labels (`annotations.csv`) are never read.
 
 ## First start
 
